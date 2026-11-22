@@ -1,73 +1,195 @@
-# CertiFlow — Skilling Certificate Issuance Platform
+# CertiFlow: Skilling Certificate Issuance Platform
 
-Run: `docker compose up --build` → open http://localhost:8080. Tests: `docker compose --profile test run --rm tests`. Details in [SETUP.md](SETUP.md); production plan in [DEPLOYMENT.md](DEPLOYMENT.md).
+A platform where training centres send batches of passed candidates for approval, officers approve them, every candidate gets a certificate on WhatsApp, and anyone can check that a certificate is genuine.
 
-## 1. Requirements note (decisions where the brief was unclear)
+Built for the Algohire hackathon (Pragati Skills Mission problem statement).
 
-| Question | Decision | Why |
-|---|---|---|
-| What is "big"? | Batch ≥ **50** candidates gets quality-team review (`QUALITY_THRESHOLD`) | Brief gives no number; configurable |
-| "More than one officer" at district | **2 distinct officers of the same district** (`STAGES` in `lib.ts`) | Smallest number that satisfies "more than one"; unique DB constraint stops one officer counting twice |
-| Order of steps | Centre → District (2) → Quality (only if big) → State (final) | Quality is "a closer look" before the final decision |
-| Sent back, then resent: what happens to approvals? | **All earlier approvals are void; the batch restarts at district stage** (`round` counter) | The content changed after they approved, so their approval no longer describes what is in front of them. Recorded in the audit log |
-| Reject vs send back | Reject is final; send back lets the centre fix and resend | Matches "approve it, reject it or send it back with a reason" |
-| "Officers sometimes make mistakes, so they should be able to fix them" | Interpreted as **send back / return with reason** (before issue) and **state office can cancel an issued certificate**. Approvals are not silently editable | Anything that changes a decision must leave a record |
-| "Too long" with an officer | **48h** in a stage (`SLA_SECONDS`) → batch flagged STUCK, audited, realtime alert to everyone logged in; state office sees it in the list | Nobody has to chase |
-| Who can verify / what do they see | Anyone, via an unguessable token in the certificate's QR code. Shows status, serial, **masked name** (“Asha R.”), course. Never phone number | Employers need genuine/not genuine; strangers need nothing more |
-| How a candidate downloads | Link in the WhatsApp message contains the same unguessable token (possession = access) | No login for candidates; cancelled → HTTP 410 |
-| Duplicates | One certificate per candidate (DB unique); a phone cannot hold two VALID certificates for the same course (partial unique index; checked at upload too) | "Never two certificates" |
-| Spreadsheet format | **CSV** with `name,phone` (export from Excel). Whole file validated; every bad row reported; all-or-nothing | xlsx parsing was out of scope for time |
+---
 
-Roles: *Centre* sees only its own batches. *District officer* sees non-draft batches of its district. *Quality/State* see all non-draft batches. Only the right role at the right stage can decide; identity always comes from the signed token.
+## 1. Requirements note (what we understood)
 
-## 2. How it fits together
+**The problem in one line:** certificates take weeks, nobody knows who approved what, and fake certificates are going around.
+
+**Who uses it**
+
+| Person | What they do |
+|---|---|
+| Training centre (Anika) | Uploads a batch of candidates and sends it for approval. Fixes it if it is sent back. |
+| District officers (Dev, Meera, Kabir) | Review batches from their district. **Two different officers** must approve. |
+| Quality team (Neha) | Extra check for **big batches (50 or more candidates)**. |
+| State office (Farah) | Final approval. Sees stuck batches. Can cancel a certificate. |
+| Candidate | Gets the certificate on WhatsApp and can download it. |
+| Employer / public | Checks a certificate without logging in. |
+
+**The approval path**
 
 ```
-Browser ──► nginx(web) ──► API (Express, N instances) ──► PostgreSQL (source of truth + audit log)
-   ▲  SSE                      │  ▲ publish                   ▲
-   └──────── Redis pub/sub ◄───┘  │                          │
-                                  ▼ enqueue after commit      │
-                              Redis (BullMQ "issue" queue) ──► Worker (M instances): PDF → WhatsApp → mark SENT
-                                  Redis (verify cache, rate limit)        │
-                                                                          ▼
-                                                         whatsapp-mock (fails / times out / de-dupes)
+Draft -> District review (2 officers) -> [Quality review if 50+] -> State review -> Issuing -> Issued
+```
+An officer can also **approve**, **send back** (with a reason) or **reject** (with a reason).
+
+**Decisions we made where the brief was not clear**
+
+| Question in the brief | Our decision |
+|---|---|
+| What is "the spreadsheet"? | Candidate lists are uploaded as **CSV** (the standard export from Excel and Google Sheets). Columns: `name`, `phone`. |
+| What is a "big batch"? | **50 or more candidates** go through the quality team. |
+| How many district approvals? | **2**, from two different officers. The same officer cannot approve twice. |
+| What happens to old approvals when a batch is sent back and resent? | **They are voided and review starts again.** The candidates changed, so earlier approvals no longer apply. The old approvals stay in the history for the record. |
+| What counts as "stuck"? | A batch waiting too long with one step is **marked stuck and escalated to the state office** automatically. |
+| What does the public see when checking a certificate? | Only: genuine or cancelled, serial number, a masked name (like "Asha R."), and the course. **Never the phone number.** |
+
+---
+
+## 2. How it works (simple version)
+
+1. **Anika uploads a CSV.** The system checks **every row first**. If any row is bad, she sees the exact row numbers and errors, and **nothing is saved**.
+2. **She sends the batch for approval.** Officers see it in their list with a "Needs you" tag.
+3. **Two district officers approve.** If two click at the same moment, the batch still moves forward only once.
+4. **Quality team approves** (only for 50+ candidates), then **state office approves.**
+5. **On the final approval**, the system creates **one certificate per candidate** (each with a unique serial number like `PSM-2026-000001`) and puts one job per certificate on a queue.
+6. **A background worker** takes each job, makes the PDF with a QR code, and sends the WhatsApp message. WhatsApp fails and times out often, so the worker **retries**, but each certificate still gets **exactly one** message.
+7. **Anyone can verify** a certificate from the link or QR code. If the state office cancels it, the next check shows **Cancelled** immediately.
+8. **Everything is recorded** in a history (who did what, and when), and the screen updates **live** without refreshing.
+
+---
+
+## 3. How it is put together
+
+```mermaid
+flowchart LR
+  B[Browser<br/>React] --> W[web<br/>nginx]
+  W --> A[api<br/>Node + TypeScript]
+  A --> P[(PostgreSQL<br/>all data)]
+  A --> R[(Redis<br/>job queue)]
+  R --> K[worker<br/>PDF + sending]
+  K --> P
+  K --> M[WhatsApp mock<br/>fails and times out]
 ```
 
-### What is used where, and why
-| Piece | Where | Why it is there |
+| Piece | What it does | Why it is there |
 |---|---|---|
-| React + Vite | `frontend/` | One page app: role switcher, batch list, detail, public `#/verify/<token>` page |
-| nginx | `frontend/nginx.conf` | Serves the build, proxies `/api` (SSE-safe), the single entry point |
-| Express + TypeScript | `backend/src/app.ts` | REST API; `lib.ts` holds auth, stage rules, CSV save helpers |
-| PostgreSQL | `backend/migrations/*.sql` | Truth: batches, approvals, certificates, audit log. Uses row locks (`FOR UPDATE`), unique constraints, a sequence for serial numbers |
-| Plain SQL migrations (`migrate.ts`) | `backend/migrations` | Versioned, applied once under an advisory lock (see limitations: not Prisma/Drizzle) |
-| Redis | `infra.ts` | (a) BullMQ queue backend, (b) pub/sub to fan realtime events out to every API instance, (c) verify cache + rate-limit counters |
-| BullMQ | `infra.ts`, `worker.ts` | Queue with retries + exponential backoff + stalled-job recovery; job id = certificate id so no duplicates |
-| Worker | `worker.ts` | Generates PDF (pdfkit + QR), sends WhatsApp, marks SENT, closes batch; scheduled SLA scan + re-queue sweeper (`maint.ts`) |
-| whatsapp-mock | `whatsapp-mock/` | Stand-in provider: 20% 503, 15% “slow” (delivered but response late), de-duplicates by `Idempotency-Key` |
-| SSE | `app.ts /events` | Realtime without refresh; payload is only `{type, batchId}`, UI refetches through authorised endpoints (no data leaks over the stream) |
-| pino | everywhere | Structured logs with request ids |
-| Vitest | `backend/tests` | Integration tests against the running stack |
+| **web** (React + Vite, served by nginx) | The screens people use | Simple, fast, and nginx also forwards `/api` to the backend |
+| **api** (Node.js + TypeScript) | Rules, permissions, approvals, public verify page | One place that enforces who can do what |
+| **PostgreSQL** | Stores batches, candidates, approvals, certificates, history | Needs real transactions and unique rules (no duplicate certificates) |
+| **Redis + queue** | Holds the list of certificates waiting to be delivered | Slow or unreliable work (PDF, WhatsApp) never makes the user wait, and jobs survive a restart |
+| **worker** | Makes PDFs, sends WhatsApp messages, retries | Can be scaled by running more copies |
+| **WhatsApp mock** | Pretends to be WhatsApp: fails 20% of the time, hangs 15% of the time | There is no real WhatsApp account, so we test against something that behaves badly on purpose |
+| **migrate** | Creates the tables and demo data at start-up | A fresh clone works with one command |
 
-### Key technical decisions
-1. **Concurrency:** `decision` locks the batch row (`SELECT … FOR UPDATE`) inside a transaction. Two simultaneous approvals run one after the other; count reaches 2 once, the batch advances once (test 2). Approvals have a unique key, so one officer cannot count twice.
-2. **Exactly one certificate, despite WhatsApp:** DB rows are created in the approval transaction (unique per candidate). Delivery is at-least-once with an **idempotency key = certificate id**; the provider de-duplicates. The worker is idempotent (skips SENT/cancelled, PDF written once via temp file + rename). A timeout where the message *was* delivered is retried safely.
-3. **Never lose work if Redis is down at approval time:** certificates are committed first, jobs enqueued after. A sweeper re-queues any certificate undelivered after 60s (also drains a WhatsApp outage, 1000 per minute).
-4. **Instant cancellation:** cancel writes DB, then overwrites the verify cache with a cancelled marker. Cache fill uses `SET NX` with 30s TTL, so a stale fill cannot overwrite it; worst case if Redis is down is a 0s staleness because there is no cache to be stale.
-5. **Stateless instances:** all state in Postgres/Redis; SSE broadcast via Redis; scheduler jobs run once cluster-wide. Kill any API/worker anytime.
-6. **Audit:** every decision and every delivery attempt writes `audit_log` (actor, action, batch, certificate, details) inside the same transaction as the decision. `GET /api/batches/:id` returns the end-to-end timeline.
+**Why a queue (events)?** When the state office approves 60 candidates, the page answers at once and the worker does the slow work in the background. If the worker crashes, the jobs are still waiting and another worker picks them up.
 
-## 3. Known limitations / next steps (honest list)
-- Uses `pg` + hand-written SQL migrations instead of Prisma/Drizzle (time); a migration tool swap is mechanical.
-- CSV only; no xlsx. Candidate details limited to name + phone.
-- Demo login (`/auth/demo-login`) has no passwords by design; production needs real SSO/OTP (`DEMO_LOGIN=0`).
-- `ENABLE_TEST_HOOKS=1` in compose exposes an endpoint that fakes batch age; must be off in production.
-- PDFs live on a shared volume; production plan uses object storage (DEPLOYMENT.md).
-- SSE events are broadcast to all logged-in clients (ids only, no personal data).
-- Retry backoff is uncapped exponential (10 attempts); the sweeper provides the long-tail retry.
-- If the last undelivered certificate of a batch is cancelled, the batch stays ISSUING until touched (edge case).
-- Not load-tested; tests are integration tests, no unit tests for the CSV parser.
-- I could not run Docker in the authoring environment: the TypeScript and frontend compile cleanly, but run the test suite yourself before submitting.
+---
 
-## 4. AI usage
-*Edit this to match what you actually did.* Claude generated the first version of the code and docs. I read and can explain every file; I checked the output by compiling, running the test suite, and manually exercising the flows in the UI (two officers approving at once, cancelling a certificate, escalation).
+## 4. Key technical decisions and reasons
+
+| Decision | Reason |
+|---|---|
+| **Check all CSV rows first, then save in one transaction** | "Nothing half-saved" |
+| **Lock the batch row when an officer decides** | Two officers at the same moment can't move the batch forward twice |
+| **Database rules for uniqueness** (one certificate per candidate, unique serial numbers) | The database enforces it, so a bug in code can't create duplicates |
+| **Certificate id is used as the queue job id** | The same certificate can't be queued twice |
+| **Certificate id is also sent as an idempotency key to WhatsApp** | If a message was delivered but the reply timed out, the retry does not send a second one |
+| **Retries with growing wait times** (up to 20 tries) | Survives a failing provider without hammering it |
+| **Random 64-character token on each certificate** | The public link can't be guessed or counted up |
+| **Permissions checked on the server, not in the screen** | Hiding a button is not security. The server decides from the signed login token, never from what the browser says |
+| **Public verify page reads the database every time (no cache)** | A cancelled certificate must never show as genuine |
+| **Every decision goes into a history table** | Every decision can be traced to who made it and when |
+| **Demo user switcher** | For reviewers only. It is not real login. In production this would be proper sign-in. |
+
+---
+
+## 5. Run it
+
+You need Docker. From the project folder:
+
+```bash
+docker compose up --build
+```
+
+Then open **http://localhost:8080**.
+
+- Delivered WhatsApp messages (from the mock): http://localhost:4010/sent
+- Full steps, including starting from a fresh clone, are in [SETUP.md](SETUP.md).
+
+**Run the tests:**
+
+```bash
+docker compose --profile test run --rm tests
+```
+
+---
+
+## 6. Demo users
+
+Use the "Demo user" dropdown at the top right. Sample data is loaded automatically.
+
+| Name | Role |
+|---|---|
+| Anika | Training centre |
+| Dev, Meera, Kabir | District officers (Hyderabad) |
+| Neha | Quality team |
+| Farah | State office |
+
+**Quick try:** as Anika, create a batch from `frontend/public/sample.csv` and send it for approval. Then approve as Dev, then Meera, then Farah. Watch the certificates go from PENDING to SENT in the history. Click **Verify** on one, then cancel it as Farah and reload the verify page.
+
+(A second centre user, Ravi, exists in the data only for the tests. It proves one centre cannot see another centre's batches.)
+
+---
+
+## 7. Tests
+
+11 automated tests, all passing. Each proves one thing from the brief.
+
+| Test | What it proves |
+|---|---|
+| 1. Bad rows | Exact row errors, nothing saved |
+| 2. Two officers at the same moment | Batch moves forward once |
+| 2b. Same officer twice | Second approval is refused |
+| 3. 60 candidates | Quality step is required, 60 unique certificates, **one WhatsApp message each**, despite failures |
+| 4. Cancel | Cancelled certificate is invalid for verifiers and downloads straight away |
+| 5. Stuck batch | It is escalated to the state office without anyone chasing |
+| 6. Return, fix, resubmit | Earlier approvals are voided and review restarts |
+| Never-happen: bad or tampered login | Rejected |
+| Never-happen: wrong role or wrong step | Cannot act |
+| Never-happen: another centre | Cannot see or edit someone else's batch |
+| Never-happen: public verify page | Leaks no personal data and cannot be enumerated |
+
+There is also `scenarios.mjs`, a script that runs the main scenarios against the running system (`node scenarios.mjs`).
+
+---
+
+## 8. How we used AI
+
+**Tools:** Claude (Anthropic).
+
+**What AI helped with**
+- The first version of the backend, worker, WhatsApp mock, frontend and tests.
+- The new dashboard design (layout, approval tracker, stylesheet).
+- Debugging Docker, Git and test problems.
+
+**How we checked its output**
+- Ran the whole stack with `docker compose up --build` and clicked through the full flow as each demo user.
+- Ran the automated tests. Test 3 failed at first. We investigated and found the WhatsApp mock container had crashed and the queue was full of old failed jobs. After a clean restart (`docker compose down -v`) all 11 tests passed. The cause was our setup, not the code.
+- Checked the database directly (`certificates` table) to see that retries really happened (38 of 84 certificates needed more than one try).
+- Opened a certificate link from a WhatsApp message and confirmed it downloads a PDF without logging in.
+- Where AI first guessed wrong about a problem (for example the cause of the failing test), we ran the checks first and only fixed what the output showed.
+
+---
+
+## 9. Known gaps and next steps (honest list)
+
+- **CSV only.** Excel files must be saved as CSV first. Reading `.xlsx` directly is a next step.
+- **Demo login is not real authentication.** A real version needs proper sign-in, password or OTP, and sessions.
+- **Delivery after many failures.** A certificate that fails all its retries is marked FAILED. A background sweeper tries to re-queue it, but we did not test a long WhatsApp outage.
+- **The WhatsApp mock container crashed once** during development and nothing restarted it. Adding `restart: unless-stopped` to the services is a next step.
+- **Database tooling.** We use plain SQL migration files, not Prisma or Drizzle.
+- **Not load-tested.** The 30,000 certificates in an hour plan is on paper only, see [DEPLOYMENT.md](DEPLOYMENT.md).
+- **Editor warnings.** The frontend has no `tsconfig.json`, so VS Code shows red lines on the code. The app still builds and runs.
+
+---
+
+## 10. More documents
+
+- [SETUP.md](SETUP.md): from a fresh clone to a running system
+- [DEPLOYMENT.md](DEPLOYMENT.md): production plan for 100,000 users and results-day peak
