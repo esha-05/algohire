@@ -1,4 +1,14 @@
 import { useEffect, useState, useCallback } from 'react';
+import * as XLSX from 'xlsx';
+
+// Accepts .csv, .xlsx or .xls and always returns CSV text for the API (the backend stays unchanged).
+async function fileToCsv(file: File): Promise<string> {
+  if (/\.xlsx?$/i.test(file.name)) {
+    const wb = XLSX.read(await file.arrayBuffer());
+    return XLSX.utils.sheet_to_csv(wb.Sheets[wb.SheetNames[0]], { blankrows: false });
+  }
+  return file.text();
+}
 
 const NEED: any = { DISTRICT_REVIEW: 2, QUALITY_REVIEW: 1, STATE_REVIEW: 1 };
 const STEP_ROLE: any = { DISTRICT_REVIEW: 'DISTRICT', QUALITY_REVIEW: 'QUALITY', STATE_REVIEW: 'STATE' };
@@ -25,6 +35,12 @@ async function api(path: string, token: string, method = 'GET', body?: any) {
 }
 const fmt = (e: any) =>
   e?.errors ? e.errors.map((x: any) => `Row ${x.row}: ${x.message}`).join('\n') : e?.error || 'Something went wrong';
+
+// Demo setup from the brief: Anika (centre), Dev/Meera/Kabir (district), Neha (quality), Farah (state).
+// Ravi is a second centre used only by the automated tests to prove one centre cannot see another's batches.
+const HIDDEN_DEMO_USERS = ['ravi'];
+const ROLE_NAME: any = { CENTRE: 'Training centre', DISTRICT: 'District officer', QUALITY: 'Quality team', STATE: 'State office' };
+const ORDER = ['anika', 'dev', 'meera', 'kabir', 'neha', 'farah'];
 
 const Badge = ({ s }: { s: string }) => <span className={'badge ' + (TONE[s] || 'grey')}>{LABEL[s] || s}</span>;
 
@@ -89,7 +105,11 @@ function Portal() {
     setMe(j.user);
   }
   useEffect(() => {
-    fetch('/api/demo-users').then(r => r.json()).then(u => { setUsers(u); login('anika'); });
+    fetch('/api/demo-users').then(r => r.json()).then((u: any[]) => {
+      const shown = u.filter(x => !HIDDEN_DEMO_USERS.includes(x.id))
+        .sort((a, b) => ORDER.indexOf(a.id) - ORDER.indexOf(b.id));
+      setUsers(shown); login('anika');
+    });
   }, []);
   // Realtime: any server event bumps `tick`; components refetch through the normal authorised endpoints.
   useEffect(() => {
@@ -115,13 +135,13 @@ function Portal() {
         </div>
         {toast && <button className="toast" onClick={() => setToast('')}>{toast} (dismiss)</button>}
         <div className="who">
-          {me && <span className="role-chip">{me.role}{me.district ? ' · ' + me.district : ''}</span>}
+          {me && <span className="role-chip">{ROLE_NAME[me.role] || me.role}{me.district ? ' · ' + me.district : ''}</span>}
           <label>
             <span className="who-label">Demo user</span>
             <select value={me?.id || ''} onChange={e => login(e.target.value)}>
               {users.map(u => (
                 <option key={u.id} value={u.id}>
-                  {u.name} ({u.role}{u.district ? ' · ' + u.district : ''})
+                  {u.name}: {ROLE_NAME[u.role] || u.role}{u.district ? ' · ' + u.district : ''}
                 </option>
               ))}
             </select>
@@ -249,14 +269,14 @@ function NewBatch({ token, onDone }: any) {
       <input placeholder="Course, e.g. Retail Sales" value={f.course} onChange={e => setF({ ...f, course: e.target.value })} />
       <input
         type="file"
-        accept=".csv"
+        accept=".csv,.xlsx,.xls"
         onChange={async e => {
           const file = e.target.files?.[0];
-          if (file) { setF({ ...f, csv: await file.text() }); setFileName(file.name); }
+          if (file) { setF({ ...f, csv: await fileToCsv(file) }); setFileName(file.name); }
         }}
       />
       <p className="muted small">
-        CSV with columns <code>name,phone</code>. <a href="/sample.csv">Download sample</a>
+        CSV or Excel file with columns <code>name</code> and <code>phone</code>. <a href="/sample.csv">Download sample</a>
         {f.csv && ` · ${fileName}: ${rows} rows loaded`}
       </p>
       <button className="primary" disabled={busy} onClick={create}>{busy ? 'Creating…' : 'Create draft'}</button>
@@ -348,9 +368,9 @@ function Detail({ id, me, token, tick }: any) {
         <div className="actions">
           <label className="filebtn">
             Replace CSV
-            <input type="file" accept=".csv" onChange={async e => {
+            <input type="file" accept=".csv,.xlsx,.xls" onChange={async e => {
               const f = e.target.files?.[0];
-              if (f) act(async () => api(`/batches/${id}/candidates`, token, 'PUT', { csv: await f.text() }));
+              if (f) act(async () => api(`/batches/${id}/candidates`, token, 'PUT', { csv: await fileToCsv(f) }));
             }} />
           </label>
           <button className="primary" disabled={busy} onClick={() => act(() => api(`/batches/${id}/submit`, token, 'POST'))}>
