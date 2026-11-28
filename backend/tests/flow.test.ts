@@ -4,7 +4,8 @@ const API = process.env.API_URL || 'http://localhost:8080/api';
 const WA = process.env.WA_URL || 'http://localhost:4010';
 const tokens: Record<string, string> = {};
 const RUN = 100000 + Math.floor(Math.random() * 800000);
-const COURSE = `Course ${RUN}`;
+const COURSE = 'Python Programming';        // seeded rule v1: attendance>=80, theory>=40, practical>=40
+const HDR = 'name,phone,attendance,theory_marks,practical_marks';
 let seq = 0;
 
 async function login(id: string) {
@@ -17,7 +18,7 @@ async function call(as: string | null, method: string, path: string, body?: any)
   const r = await fetch(API + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, body: await r.json().catch(() => null) };
 }
-const csv = (n: number) => ['name,phone', ...Array.from({ length: n }, () => { const k = seq++; return `Person ${String.fromCharCode(65 + (k % 26))}${String.fromCharCode(65 + (Math.floor(k / 26) % 26))},9${RUN}${String(k).padStart(3, '0')}`; })].join('\n');
+const csv = (n: number) => [HDR, ...Array.from({ length: n }, () => { const k = seq++; return `Person ${String.fromCharCode(65 + (k % 26))}${String.fromCharCode(65 + (Math.floor(k / 26) % 26))},9${RUN}${String(k).padStart(3, '0')},90,60,60`; })].join('\n');
 async function newBatch(n: number, submit = true) {
   const r = await call('anika', 'POST', '/batches', { title: `Test batch ${n}`, course: COURSE, csv: csv(n) });
   expect(r.status).toBe(201);
@@ -39,9 +40,9 @@ async function approveAll(id: string, big = false) {
 describe('moments that must work', () => {
   it('1. bad spreadsheet rows: exact errors, nothing saved', async () => {
     const before = (await call('anika', 'GET', '/batches')).body.length;
-    const r = await call('anika', 'POST', '/batches', { title: 'Bad batch', course: COURSE, csv: 'name,phone\nAsha Rao,9900000000\n,123\nBob 9,9811111111\nAsha Again,9900000000' });
+    const r = await call('anika', 'POST', '/batches', { title: 'Bad batch', course: COURSE, csv: HDR + '\nAsha Rao,9900000000,90,60,60\n,123,90,60,60\nBob 9,9811111111,90,60,60\nAsha Again,9900000000,90,60,60\nCara Dev,9822222222,120,abc,60' });
     expect(r.status).toBe(422);
-    expect(r.body.errors.map((e: any) => e.row)).toEqual(expect.arrayContaining([3, 4, 5]));
+    expect(r.body.errors.map((e: any) => e.row)).toEqual(expect.arrayContaining([3, 4, 5, 6]));
     expect((await call('anika', 'GET', '/batches')).body.length).toBe(before);
   });
 
@@ -107,6 +108,43 @@ describe('moments that must work', () => {
     expect(d.approvals.length).toBe(1);
     await decide('meera', id);
     expect((await detail(id)).batch.status).toBe('STATE_REVIEW');
+  });
+});
+
+describe('eligibility and versioned rules', () => {
+  const rawBatch = async (course: string, rows: string[]) => {
+    const r = await call('anika', 'POST', '/batches', { title: 'Rule test', course, csv: [HDR, ...rows].join('\n') });
+    expect(r.status).toBe(201);
+    await call('anika', 'POST', `/batches/${r.body.id}/submit`);
+    return r.body.id as string;
+  };
+  const ph = () => `9${RUN}${String(seq++).padStart(3, '0')}`;
+
+  it('2. raising a pass mark: old batch keeps its rule version, new batch uses the new one', async () => {
+    const course = `Rule course ${RUN}`;
+    const set = (a: number) => call('farah', 'POST', '/courses/rules', { course, minAttendance: a, minTheory: 40, minPractical: 40 });
+    const v1 = (await set(80)).body.version;
+    const oldId = await rawBatch(course, [`Mona Rao,${ph()},90,60,60`]);
+    const v2 = (await set(95)).body.version;
+    const newId = await rawBatch(course, [`Mona Rao,${ph()},90,60,60`]);
+    const [o, n] = [await detail(oldId), await detail(newId)];
+    expect(v2).toBe(v1 + 1);
+    expect(o.rule.version).toBe(v1); expect(o.candidates[0].eligible).toBe(true);
+    expect(n.rule.version).toBe(v2); expect(n.candidates[0].eligible).toBe(false);
+    expect((await call('dev', 'POST', '/courses/rules', { course, minAttendance: 1, minTheory: 1, minPractical: 1 })).status).toBe(403);
+  });
+
+  it('ineligible candidate gets no certificate without an override + reason', async () => {
+    const id = await rawBatch(COURSE, [`Good One,${ph()},90,60,60`, `Low Attend,${ph()},50,60,60`]);
+    await approveAll(id);
+    expect((await detail(id)).certificates.length).toBe(1);
+    const id2 = await rawBatch(COURSE, [`Good Two,${ph()},90,60,60`, `Low Attend,${ph()},50,60,60`]);
+    const bad = (await detail(id2)).candidates.find((c: any) => !c.eligible);
+    expect((await call('dev', 'POST', `/candidates/${bad.id}/override`, { reason: 'Medical leave' })).status).toBe(403);
+    expect((await call('farah', 'POST', `/candidates/${bad.id}/override`, { reason: 'Medical leave, approved' })).status).toBe(200);
+    await approveAll(id2);
+    expect((await detail(id2)).certificates.length).toBe(2);
+    expect((await detail(id2)).timeline.some((t: any) => t.action === 'candidate.override')).toBe(true);
   });
 });
 
