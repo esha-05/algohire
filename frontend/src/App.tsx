@@ -1,454 +1,271 @@
-import { useEffect, useState, useCallback } from 'react';
-import * as XLSX from 'xlsx';
+import express, { Request, Response, NextFunction } from 'express';
+import helmet from 'helmet';
+import pino from 'pino';
+import pinoHttp from 'pino-http';
+import { z } from 'zod';
+import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
+import { cfg } from './config';
+import { pool, tx, audit } from './db';
+import { redis, publish, enqueueIssue } from './infra';
+import { runScan } from './maint';
+import { HttpError, wrap, auth, signToken, verifyToken, STAGES, getBatch, validateCsv, saveCandidates } from './lib';
 
-// Accepts .csv, .xlsx or .xls and always returns CSV text for the API (the backend stays unchanged).
-async function fileToCsv(file: File): Promise<string> {
-  if (/\.xlsx?$/i.test(file.name)) {
-    const wb = XLSX.read(await file.arrayBuffer());
-    return XLSX.utils.sheet_to_csv(wb.Sheets[wb.SheetNames[0]], { blankrows: false });
-  }
-  return file.text();
+export const log = pino({ level: process.env.LOG_LEVEL || 'info' });
+export const app = express();
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(pinoHttp({ logger: log, redact: ['req.headers.authorization'], genReqId: (req: any) => req.headers['x-request-id'] || randomUUID() }) as any);
+app.use(express.json({ limit: '1mb' }));
+const r = express.Router();
+
+// ---------- public ----------
+r.get('/healthz', wrap(async (_q, res) => { await pool.query('SELECT 1'); await redis.ping(); res.json({ ok: true }); }));
+r.get('/demo-users', wrap(async (_q, res) => res.json((await pool.query('SELECT id,name,role,district FROM users ORDER BY role,name')).rows)));
+r.post('/auth/demo-login', wrap(async (req, res) => {
+  if (!cfg.demoLogin) throw new HttpError(404, 'Not found');
+  const { userId } = z.object({ userId: z.string() }).parse(req.body);
+  const { rows: [u] } = await pool.query('SELECT * FROM users WHERE id=$1', [userId]);
+  if (!u) throw new HttpError(404, 'Unknown user');
+  res.json({ token: signToken({ sub: u.id, name: u.name, role: u.role, district: u.district, centre: u.centre_id }), user: { id: u.id, name: u.name, role: u.role } });
+}));
+
+// Public verification: reveals only status + masked holder name. Lookup is by an unguessable token, so serials cannot be enumerated.
+async function limit(req: Request, _res: Response, next: NextFunction) {
+  try {
+    const k = `rl:${req.ip}:${Math.floor(Date.now() / 60000)}`;
+    const n = await redis.incr(k);
+    if (n === 1) await redis.expire(k, 70);
+    if (n > 120) return next(new HttpError(429, 'Too many requests'));
+  } catch { /* fail open: verification must keep working if Redis is down */ }
+  next();
 }
+const mask = (n: string) => { const p = n.split(' '); return p.length > 1 ? `${p[0]} ${p[p.length - 1][0]}.` : p[0]; };
+const view = (c: any) => ({ status: c.status, serial: c.serial, holder: mask(c.name), course: c.course, issuedAt: c.issued_at, cancelledAt: c.cancelled_at });
+const TOKEN = /^[a-f0-9]{64}$/;
 
-const NEED: any = { DISTRICT_REVIEW: 2, QUALITY_REVIEW: 1, STATE_REVIEW: 1 };
-const STEP_ROLE: any = { DISTRICT_REVIEW: 'DISTRICT', QUALITY_REVIEW: 'QUALITY', STATE_REVIEW: 'STATE' };
-const LABEL: any = {
-  DRAFT: 'Draft', RETURNED: 'Returned', REJECTED: 'Rejected',
-  DISTRICT_REVIEW: 'District review', QUALITY_REVIEW: 'Quality review', STATE_REVIEW: 'State review',
-  ISSUING: 'Issuing', ISSUED: 'Issued',
-};
-const TONE: any = {
-  DRAFT: 'grey', RETURNED: 'amber', REJECTED: 'red',
-  DISTRICT_REVIEW: 'blue', QUALITY_REVIEW: 'blue', STATE_REVIEW: 'blue',
-  ISSUING: 'amber', ISSUED: 'green',
-};
+r.get('/verify/:token', limit, wrap(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const t = req.params.token;
+  if (!TOKEN.test(t)) return res.status(404).json({ status: 'NOT_FOUND' });
+  const key = `verify:${t}`;
+  const hit = await redis.get(key).catch(() => null);
+  if (hit) return res.json(JSON.parse(hit));
+  const { rows: [c] } = await pool.query('SELECT serial,name,course,status,issued_at,cancelled_at FROM certificates WHERE token=$1', [t]);
+  if (!c) return res.status(404).json({ status: 'NOT_FOUND' });
+  const body = view(c);
+  await redis.set(key, JSON.stringify(body), 'EX', 30, 'NX').catch(() => {});   // NX: never overwrite a cancellation tombstone
+  res.json(body);
+}));
 
-async function api(path: string, token: string, method = 'GET', body?: any) {
-  const r = await fetch('/api' + path, {
-    method,
-    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-    body: body ? JSON.stringify(body) : undefined,
+r.get('/c/:token/pdf', limit, wrap(async (req, res) => {
+  if (!TOKEN.test(req.params.token)) throw new HttpError(404, 'Not found');
+  const { rows: [c] } = await pool.query('SELECT id,serial,status FROM certificates WHERE token=$1', [req.params.token]);
+  if (!c) throw new HttpError(404, 'Not found');
+  if (c.status !== 'VALID') throw new HttpError(410, 'This certificate has been cancelled');
+  const file = path.join(cfg.storage, `${c.id}.pdf`);
+  if (!fs.existsSync(file)) throw new HttpError(404, 'Certificate is still being prepared');
+  res.download(file, `${c.serial}.pdf`);
+}));
+
+// ---------- realtime (SSE) ----------
+const clients = new Set<Response>();
+const sub = redis.duplicate();
+sub.subscribe('events').catch(() => {});
+sub.on('message', (_c, m) => clients.forEach(c => c.write(`data: ${m}\n\n`)));
+r.get('/events', (req, res) => {
+  try { verifyToken(String(req.query.token || '')); } catch { return res.sendStatus(401); }
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders();
+  res.write(': ok\n\n');
+  clients.add(res);
+  const t = setInterval(() => res.write(': ka\n\n'), 20000);
+  req.on('close', () => { clearInterval(t); clients.delete(res); });
+});
+
+// ---------- batches ----------
+r.get('/batches', auth(), wrap(async (req, res) => {
+  const u = req.user!;
+  const { rows } = await pool.query(
+    `SELECT b.*, ce.name AS centre_name, ce.district,
+       (SELECT count(*) FROM approvals a WHERE a.batch_id=b.id AND a.round=b.round AND a.stage=b.status)::int AS approvals,
+       EXISTS(SELECT 1 FROM approvals a WHERE a.batch_id=b.id AND a.round=b.round AND a.stage=b.status AND a.officer_id=$1) AS my_approved
+     FROM batches b JOIN centres ce ON ce.id=b.centre_id
+     WHERE ($2::text='CENTRE' AND b.centre_id=$3)
+        OR ($2::text='DISTRICT' AND ce.district=$4 AND b.status<>'DRAFT')
+        OR ($2::text IN ('QUALITY','STATE') AND b.status<>'DRAFT')
+     ORDER BY b.updated_at DESC LIMIT 200`, [u.sub, u.role, u.centre ?? null, u.district ?? null]);
+  res.json(rows);
+}));
+
+// Create + fill in ONE transaction: any bad row => 422 with every error, and nothing is stored.
+r.post('/batches', auth('CENTRE'), wrap(async (req, res) => {
+  const body = z.object({ title: z.string().trim().min(3).max(100), course: z.string().trim().min(2).max(80), csv: z.string().max(600000) }).parse(req.body);
+  const id = await tx(async c => {
+    const { rows, rule } = await validateCsv(c, body.course, body.csv);
+    const { rows: [b] } = await c.query(`INSERT INTO batches(centre_id,title,course,status,created_by) VALUES($1,$2,$3,'DRAFT',$4) RETURNING id`,
+      [req.user!.centre, body.title, body.course, req.user!.sub]);
+    await saveCandidates(c, b.id, rows, rule.id);
+    await audit(c, req.user!.sub, 'batch.created', { batchId: b.id }, { size: rows.length, ruleVersion: rule.version, ineligible: rows.filter((x: any) => !x.eligible).length });
+    return b.id;
   });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw j;
-  return j;
-}
-const fmt = (e: any) =>
-  e?.errors ? e.errors.map((x: any) => `Row ${x.row}: ${x.message}`).join('\n') : e?.error || 'Something went wrong';
+  publish('batch.updated', { batchId: id });
+  res.status(201).json({ id });
+}));
 
-// Demo setup from the brief: Anika (centre), Dev/Meera/Kabir (district), Neha (quality), Farah (state).
-// Ravi is a second centre used only by the automated tests to prove one centre cannot see another's batches.
-const HIDDEN_DEMO_USERS = ['ravi'];
-const ROLE_NAME: any = { CENTRE: 'Training centre', DISTRICT: 'District officer', QUALITY: 'Quality team', STATE: 'State office' };
-const ORDER = ['anika', 'dev', 'meera', 'kabir', 'neha', 'farah'];
+r.put('/batches/:id/candidates', auth('CENTRE'), wrap(async (req, res) => {
+  const { csv } = z.object({ csv: z.string().max(600000) }).parse(req.body);
+  await tx(async c => {
+    const b = await getBatch(c, req.params.id, req.user!, true);
+    if (!['DRAFT', 'RETURNED'].includes(b.status)) throw new HttpError(409, `Cannot edit a batch that is ${b.status}`);
+    const { rows, rule } = await validateCsv(c, b.course, csv);
+    await saveCandidates(c, b.id, rows, rule.id);
+    await audit(c, req.user!.sub, 'batch.candidates_replaced', { batchId: b.id }, { size: rows.length, ruleVersion: rule.version, ineligible: rows.filter((x: any) => !x.eligible).length });
+  });
+  publish('batch.updated', { batchId: req.params.id });
+  res.json({ ok: true });
+}));
 
-const Badge = ({ s }: { s: string }) => <span className={'badge ' + (TONE[s] || 'grey')}>{LABEL[s] || s}</span>;
+r.post('/batches/:id/submit', auth('CENTRE'), wrap(async (req, res) => {
+  await tx(async c => {
+    const b = await getBatch(c, req.params.id, req.user!, true);
+    if (!['DRAFT', 'RETURNED'].includes(b.status)) throw new HttpError(409, `Batch is already ${b.status}`);
+    if (!b.size) throw new HttpError(400, 'Batch has no candidates');
+    // Resubmission after a return starts a NEW round: earlier approvals are void because the content changed.
+    const round = b.status === 'RETURNED' ? b.round + 1 : b.round;
+    await c.query(`UPDATE batches SET status='DISTRICT_REVIEW', round=$2, stage_entered_at=now(), escalated_at=NULL, return_reason=NULL, updated_at=now() WHERE id=$1`, [b.id, round]);
+    await audit(c, req.user!.sub, 'batch.submitted', { batchId: b.id }, { round, earlierApprovalsVoided: b.status === 'RETURNED' });
+  });
+  publish('batch.updated', { batchId: req.params.id });
+  res.json({ ok: true });
+}));
 
-export default function App() {
-  const [hash, setHash] = useState(location.hash);
-  useEffect(() => {
-    const f = () => setHash(location.hash);
-    addEventListener('hashchange', f);
-    return () => removeEventListener('hashchange', f);
-  }, []);
-  const m = hash.match(/^#\/verify\/([a-f0-9]{64})$/);
-  return m ? <Verify token={m[1]} /> : <Portal />;
-}
+r.get('/batches/:id', auth(), wrap(async (req, res) => {
+  const b = await getBatch(pool, req.params.id, req.user!);
+  const q = (s: string, p: any[]) => pool.query(s, p).then(x => x.rows);
+  const [candidates, certificates, approvals, timeline] = await Promise.all([
+    q('SELECT id,name,phone,attendance,theory,practical,eligible,reasons,override_reason FROM candidates WHERE batch_id=$1 ORDER BY name', [b.id]),
+    q('SELECT id,serial,name,status,delivery_status,delivery_attempts,token FROM certificates WHERE batch_id=$1 ORDER BY serial', [b.id]),
+    q('SELECT officer_id,stage,created_at FROM approvals WHERE batch_id=$1 AND round=$2', [b.id, b.round]),
+    q('SELECT ts,actor,action,cert_id,details FROM audit_log WHERE batch_id=$1 ORDER BY id LIMIT 1000', [b.id]),
+  ]);
+  res.json({ batch: b, candidates, certificates, approvals, timeline, rule: (await pool.query('SELECT * FROM course_rules WHERE id=$1', [b.rule_id])).rows[0] ?? null });
+}));
 
-// Public page: no login. This is where the QR code on a certificate leads.
-function Verify({ token }: { token: string }) {
-  const [d, setD] = useState<any>(null);
-  useEffect(() => {
-    fetch('/api/verify/' + token).then(r => r.json()).then(setD).catch(() => setD({ status: 'NOT_FOUND' }));
-  }, [token]);
-  if (!d) return <p className="center">Checking certificate…</p>;
-  const ok = d.status === 'VALID';
-  const cancelled = d.status === 'CANCELLED';
-  return (
-    <div className="verify">
-      <div className={'verify-card ' + (ok ? 'v-ok' : 'v-bad')}>
-        <div className="verify-icon">{ok ? '✔' : '✖'}</div>
-        <h1>{ok ? 'Genuine certificate' : cancelled ? 'Certificate cancelled' : 'Certificate not found'}</h1>
-        <p className="muted">
-          {ok
-            ? 'This certificate was issued through CertiFlow and is currently valid.'
-            : cancelled
-            ? 'This certificate was issued but has since been cancelled. It is no longer valid.'
-            : 'No certificate matches this code. It may be forged or mistyped.'}
-        </p>
-        {d.serial && (
-          <dl className="verify-meta">
-            <dt>Serial</dt><dd>{d.serial}</dd>
-            <dt>Holder</dt><dd>{d.holder}</dd>
-            <dt>Course</dt><dd>{d.course}</dd>
-          </dl>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Portal() {
-  const [users, setUsers] = useState<any[]>([]);
-  const [me, setMe] = useState<any>(null);
-  const [token, setToken] = useState('');
-  const [tick, setTick] = useState(0);
-  const [toast, setToast] = useState('');
-
-  async function login(id: string) {
-    const j = await fetch('/api/auth/demo-login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ userId: id }),
-    }).then(r => r.json());
-    setToken(j.token);
-    setMe(j.user);
-  }
-  useEffect(() => {
-    fetch('/api/demo-users').then(r => r.json()).then((u: any[]) => {
-      const shown = u.filter(x => !HIDDEN_DEMO_USERS.includes(x.id))
-        .sort((a, b) => ORDER.indexOf(a.id) - ORDER.indexOf(b.id));
-      setUsers(shown); login('anika');
-    });
-  }, []);
-  // Realtime: any server event bumps `tick`; components refetch through the normal authorised endpoints.
-  useEffect(() => {
-    if (!token) return;
-    const es = new EventSource('/api/events?token=' + token);
-    es.onmessage = e => {
-      const ev = JSON.parse(e.data);
-      setTick(t => t + 1);
-      if (ev.type === 'batch.escalated') setToast('A batch is stuck past its SLA');
-    };
-    return () => es.close();
-  }, [token]);
-
-  return (
-    <>
-      <header className="top">
-        <div className="brand">
-          <span className="mark">C</span>
-          <div>
-            <h1>CertiFlow</h1>
-            <span className="tag">Training certificate approvals</span>
-          </div>
-        </div>
-        {toast && <button className="toast" onClick={() => setToast('')}>{toast} (dismiss)</button>}
-        <div className="who">
-          {me && <span className="role-chip">{ROLE_NAME[me.role] || me.role}{me.district ? ' · ' + me.district : ''}</span>}
-          <label>
-            <span className="who-label">Demo user</span>
-            <select value={me?.id || ''} onChange={e => login(e.target.value)}>
-              {users.map(u => (
-                <option key={u.id} value={u.id}>
-                  {u.name}: {ROLE_NAME[u.role] || u.role}{u.district ? ' · ' + u.district : ''}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-      </header>
-      {me && <Main key={token} me={me} token={token} tick={tick} />}
-    </>
-  );
-}
-
-function Main({ me, token, tick }: any) {
-  const [list, setList] = useState<any[]>([]);
-  const [sel, setSel] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'all' | 'mine'>('all');
-
-  useEffect(() => { api('/batches', token).then(setList).catch(() => {}); }, [token, tick]);
-
-  const needsMe = (b: any) => STEP_ROLE[b.status] === me.role && !b.my_approved;
-  const shown = filter === 'mine' ? list.filter(needsMe) : list;
-
-  // Open the first batch automatically so the right side is never blank.
-  useEffect(() => {
-    if (shown.length && !shown.some(b => b.id === sel)) setSel(shown[0].id);
-    if (!shown.length && sel && filter === 'mine') setSel(null);
-  }, [shown, sel, filter]);
-
-  const stats = {
-    total: list.length,
-    mine: list.filter(needsMe).length,
-    stuck: list.filter(b => b.escalated_at).length,
-    issued: list.filter(b => b.status === 'ISSUED').length,
-  };
-
-  return (
-    <main>
-      <section className="stats">
-        <Stat n={stats.total} l="Batches" />
-        <Stat n={stats.mine} l="Waiting for you" hot={stats.mine > 0} />
-        <Stat n={stats.stuck} l="Stuck past SLA" bad={stats.stuck > 0} />
-        <Stat n={stats.issued} l="Fully issued" />
-      </section>
-
-      <div className="grid">
-        <aside>
-          {me.role === 'CENTRE' && <NewBatch token={token} onDone={setSel} />}
-          <div className="list-head">
-            <h2>{me.role === 'CENTRE' ? 'My batches' : 'Batches'}</h2>
-            <div className="seg">
-              <button className={filter === 'all' ? 'on' : ''} onClick={() => setFilter('all')}>All</button>
-              <button className={filter === 'mine' ? 'on' : ''} onClick={() => setFilter('mine')}>Needs me</button>
-            </div>
-          </div>
-          {shown.map(b => (
-            <button key={b.id} className={'item' + (sel === b.id ? ' sel' : '')} onClick={() => setSel(b.id)}>
-              <div className="item-top">
-                <b>{b.title}</b>
-                <Badge s={b.status} />
-              </div>
-              <div className="muted small">{b.centre_name} · {b.size} candidates</div>
-              <div className="item-tags">
-                {NEED[b.status] && <span className="badge grey">{b.approvals}/{NEED[b.status]} approvals</span>}
-                {b.escalated_at && <span className="badge red">Stuck</span>}
-                {needsMe(b) && <span className="badge green">Needs you</span>}
-              </div>
-            </button>
-          ))}
-          {!shown.length && (
-            <div className="empty">
-              {filter === 'mine'
-                ? 'Nothing is waiting for you right now.'
-                : me.role === 'CENTRE'
-                ? 'No batches yet. Upload a CSV above to create your first draft.'
-                : 'No batches have reached you yet.'}
-            </div>
-          )}
-        </aside>
-        <section>
-          {sel ? <Detail key={sel} id={sel} me={me} token={token} tick={tick} /> : <div className="empty big">Select a batch to see its approvals, certificates and history.</div>}
-        </section>
-      </div>
-    </main>
-  );
-}
-
-function Stat({ n, l, hot, bad }: { n: number; l: string; hot?: boolean; bad?: boolean }) {
-  return (
-    <div className={'stat' + (hot ? ' hot' : '') + (bad ? ' bad' : '')}>
-      <div className="stat-n">{n}</div>
-      <div className="stat-l">{l}</div>
-    </div>
-  );
-}
-
-function NewBatch({ token, onDone }: any) {
-  const [f, setF] = useState({ title: '', course: '', csv: '' });
-  const [fileName, setFileName] = useState('');
-  const [err, setErr] = useState('');
-  const [busy, setBusy] = useState(false);
-  const rows = f.csv ? f.csv.split('\n').filter(x => x.trim()).length - 1 : 0;
-
-  async function create() {
-    if (busy) return;
-    if (!f.title.trim() || !f.course.trim() || !f.csv) {
-      setErr('Enter a batch title, a course, and choose a CSV file.');
-      return;
+// The core workflow. FOR UPDATE serialises concurrent decisions on one batch, so two simultaneous
+// "approve" calls are processed one after the other and the batch advances exactly once.
+r.post('/batches/:id/decision', auth('DISTRICT', 'QUALITY', 'STATE'), wrap(async (req, res) => {
+  const body = z.object({ decision: z.enum(['APPROVE', 'RETURN', 'REJECT']), reason: z.string().trim().min(3).max(500).optional() }).parse(req.body);
+  if (body.decision !== 'APPROVE' && !body.reason) throw new HttpError(400, 'A reason is required');
+  const u = req.user!;
+  const out = await tx(async c => {
+    const b = await getBatch(c, req.params.id, u, true);
+    const st = STAGES[b.status];
+    if (!st) throw new HttpError(409, `Batch is ${b.status}; it is not awaiting a decision`);
+    if (st.role !== u.role) throw new HttpError(403, `This step belongs to ${st.role}`);
+    let next = b.status, certIds: string[] = [];
+    if (body.decision === 'APPROVE') {
+      const ins = await c.query('INSERT INTO approvals(batch_id,round,stage,officer_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING', [b.id, b.round, b.status, u.sub]);
+      if (!ins.rowCount) throw new HttpError(409, 'You have already approved this batch at this step');
+      await audit(c, u.sub, 'batch.approved', { batchId: b.id }, { stage: b.status, round: b.round });
+      const n = (await c.query('SELECT count(*)::int AS n FROM approvals WHERE batch_id=$1 AND round=$2 AND stage=$3', [b.id, b.round, b.status])).rows[0].n;
+      if (n >= st.need) {
+        next = b.status === 'DISTRICT_REVIEW' ? (b.size >= cfg.qualityThreshold ? 'QUALITY_REVIEW' : 'STATE_REVIEW') : b.status === 'QUALITY_REVIEW' ? 'STATE_REVIEW' : 'ISSUING';
+        if (next === 'ISSUING') {   // final approval: one certificate per candidate, serials from a DB sequence, same transaction
+          const created = await c.query(
+            `INSERT INTO certificates(serial,candidate_id,batch_id,name,phone,course,token)
+             SELECT 'PSM-'||to_char(now(),'YYYY')||'-'||lpad(nextval('cert_serial_seq')::text,6,'0'), ca.id, $1::uuid, ca.name, ca.phone, $2::text,
+                    replace(gen_random_uuid()::text,'-','')||replace(gen_random_uuid()::text,'-','')
+             FROM candidates ca WHERE ca.batch_id=$1::uuid AND (ca.eligible OR ca.override_reason IS NOT NULL) ORDER BY ca.id RETURNING id`, [b.id, b.course]);
+          certIds = created.rows.map((x: any) => x.id);
+          if (!certIds.length) next = 'ISSUED';          // nobody qualified: nothing to deliver
+          await audit(c, 'system', 'batch.certificates_created', { batchId: b.id }, { count: certIds.length });
+        }
+        await c.query('UPDATE batches SET status=$2, stage_entered_at=now(), escalated_at=NULL, updated_at=now() WHERE id=$1', [b.id, next]);
+        await audit(c, 'system', 'batch.advanced', { batchId: b.id }, { from: b.status, to: next });
+      }
+    } else {
+      next = body.decision === 'RETURN' ? 'RETURNED' : 'REJECTED';
+      await c.query('UPDATE batches SET status=$2, return_reason=$3, updated_at=now() WHERE id=$1', [b.id, next, body.reason]);
+      await audit(c, u.sub, body.decision === 'RETURN' ? 'batch.returned' : 'batch.rejected', { batchId: b.id }, { stage: b.status, reason: body.reason });
     }
-    setBusy(true);
-    try {
-      setErr('');
-      const j = await api('/batches', token, 'POST', f);
-      setF({ title: '', course: '', csv: '' });
-      setFileName('');
-      onDone(j.id);
-    } catch (e) {
-      setErr(fmt(e));
-    }
-    setBusy(false);
-  }
+    return { id: b.id, status: next, certIds };
+  });
+  // After commit: slow work goes to the queue. If Redis is down here, the sweeper re-queues from the DB.
+  if (out.certIds.length) await enqueueIssue(out.certIds).catch(e => log.error({ err: e.message }, 'enqueue failed; sweeper will retry'));
+  publish('batch.updated', { batchId: out.id });
+  res.json({ status: out.status });
+}));
 
-  return (
-    <div className="card">
-      <h2>New batch</h2>
-      <input placeholder="Batch title, e.g. September retail batch" value={f.title} onChange={e => setF({ ...f, title: e.target.value })} />
-      <input placeholder="Course, e.g. Retail Sales" value={f.course} onChange={e => setF({ ...f, course: e.target.value })} />
-      <input
-        type="file"
-        accept=".csv,.xlsx,.xls"
-        onChange={async e => {
-          const file = e.target.files?.[0];
-          if (file) { setF({ ...f, csv: await fileToCsv(file) }); setFileName(file.name); }
-        }}
-      />
-      <p className="muted small">
-        CSV or Excel file with columns <code>name</code> and <code>phone</code>. <a href="/sample.csv">Download sample</a>
-        {f.csv && ` · ${fileName}: ${rows} rows loaded`}
-      </p>
-      <button className="primary" disabled={busy} onClick={create}>{busy ? 'Creating…' : 'Create draft'}</button>
-      {err && <pre className="err">{err}</pre>}
-    </div>
-  );
-}
+// ---------- course rules (data, versioned, append-only) ----------
+r.get('/courses/rules', auth(), wrap(async (_q, res) => {
+  res.json((await pool.query('SELECT DISTINCT ON (lower(course)) * FROM course_rules ORDER BY lower(course), version DESC')).rows);
+}));
+r.post('/courses/rules', auth('STATE'), wrap(async (req, res) => {
+  const b = z.object({ course: z.string().trim().min(2).max(80), minAttendance: z.number().min(0).max(100), minTheory: z.number().min(0).max(100), minPractical: z.number().min(0).max(100) }).parse(req.body);
+  const row = await tx(async c => {
+    await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [b.course.toLowerCase()]);   // two concurrent edits cannot take the same version
+    const { rows: [x] } = await c.query(
+      `INSERT INTO course_rules(course,version,min_attendance,min_theory,min_practical,created_by)
+       VALUES($1,(SELECT coalesce(max(version),0)+1 FROM course_rules WHERE lower(course)=lower($1)),$2,$3,$4,$5) RETURNING *`,
+      [b.course, b.minAttendance, b.minTheory, b.minPractical, req.user!.sub]);
+    await audit(c, req.user!.sub, 'course_rule.created', {}, x);
+    return x;
+  });
+  res.status(201).json(row);
+}));
 
-function Tracker({ b, bigBatch }: { b: any; bigBatch: boolean }) {
-  const steps = [
-    { k: 'DRAFT', l: 'Centre' },
-    { k: 'DISTRICT_REVIEW', l: 'District (2)' },
-    ...(bigBatch ? [{ k: 'QUALITY_REVIEW', l: 'Quality' }] : []),
-    { k: 'STATE_REVIEW', l: 'State' },
-    { k: 'ISSUING', l: 'Issuing' },
-    { k: 'ISSUED', l: 'Issued' },
-  ];
-  let idx = steps.findIndex(s => s.k === b.status);
-  if (b.status === 'RETURNED') idx = 0;
-  const rejected = b.status === 'REJECTED';
-  return (
-    <ol className="tracker">
-      {steps.map((s, i) => {
-        const done = b.status === 'ISSUED' || (!rejected && i < idx);
-        const cur = !rejected && i === idx && b.status !== 'ISSUED';
-        return (
-          <li key={s.k} className={(done ? 'done ' : '') + (cur ? 'cur' : '')}>
-            <span className="dot">{done ? '✔' : ''}</span>
-            <span className="tl">{s.l}</span>
-          </li>
-        );
-      })}
-      {rejected && <li className="rej"><span className="dot">✖</span><span className="tl">Rejected</span></li>}
-    </ol>
-  );
-}
+// Ineligible candidate gets a certificate ONLY with a recorded override + reason (state office, batch under review).
+r.post('/candidates/:id/override', auth('STATE'), wrap(async (req, res) => {
+  const { reason } = z.object({ reason: z.string().trim().min(3).max(500) }).parse(req.body);
+  const k = await tx(async c => {
+    const { rows: [x] } = await c.query(
+      `UPDATE candidates ca SET override_reason=$2 FROM batches b
+       WHERE ca.id=$1 AND b.id=ca.batch_id AND NOT ca.eligible AND ca.override_reason IS NULL
+         AND b.status IN ('DISTRICT_REVIEW','QUALITY_REVIEW','STATE_REVIEW') RETURNING ca.batch_id`, [req.params.id, reason]);
+    if (!x) throw new HttpError(409, 'Not an ineligible candidate in a batch under review');
+    await audit(c, req.user!.sub, 'candidate.override', { batchId: x.batch_id }, { candidateId: req.params.id, reason });
+    return x;
+  });
+  publish('batch.updated', { batchId: k.batch_id });
+  res.json({ ok: true });
+}));
 
-function Detail({ id, me, token, tick }: any) {
-  const [d, setD] = useState<any>(null);
-  const [msg, setMsg] = useState('');
-  const [busy, setBusy] = useState(false);
-  const load = useCallback(() => api('/batches/' + id, token).then(setD).catch(e => setMsg(fmt(e))), [id, token]);
-  useEffect(() => { load(); }, [load, tick]);
-  useEffect(() => { setMsg(''); }, [d?.batch?.status]);
-  if (!d) return <div className="card"><p className="muted">{msg || 'Loading…'}</p></div>;
+// ---------- state office ----------
+r.get('/stuck', auth('STATE'), wrap(async (_q, res) => {
+  res.json((await pool.query(`SELECT id,title,status,stage_entered_at,escalated_at FROM batches WHERE escalated_at IS NOT NULL AND status IN ('DISTRICT_REVIEW','QUALITY_REVIEW','STATE_REVIEW') ORDER BY stage_entered_at`)).rows);
+}));
 
-  const b = d.batch;
-  // One action at a time: a double-click cannot send a second request.
-  const act = async (fn: () => Promise<any>) => {
-    if (busy) return;
-    setBusy(true);
-    try { setMsg(''); await fn(); await load(); } catch (e) { setMsg(fmt(e)); }
-    setBusy(false);
-  };
-  const decide = (decision: string) => {
-    const reason = decision === 'APPROVE' ? undefined : prompt('Reason (required)') || '';
-    if (decision !== 'APPROVE' && !reason) return;
-    act(() => api(`/batches/${id}/decision`, token, 'POST', { decision, reason }));
-  };
-  const canDecide = STEP_ROLE[b.status] === me.role && !d.approvals.some((a: any) => a.officer_id === me.id);
-  const editable = me.role === 'CENTRE' && ['DRAFT', 'RETURNED'].includes(b.status);
-  const bigBatch = (b.size ?? d.candidates.length) >= 50;
-  const sent = d.certificates.filter((c: any) => c.delivery_status === 'SENT').length;
-  const total = d.certificates.length;
+r.post('/certificates/:id/cancel', auth('STATE'), wrap(async (req, res) => {
+  const { reason } = z.object({ reason: z.string().trim().min(3).max(500) }).parse(req.body);
+  const row = await tx(async c => {
+    const { rows: [x] } = await c.query(
+      `UPDATE certificates SET status='CANCELLED', cancel_reason=$2, cancelled_by=$3, cancelled_at=now() WHERE id=$1 AND status='VALID' RETURNING *`,
+      [req.params.id, reason, req.user!.sub]);
+    if (!x) throw new HttpError(409, 'Certificate not found or already cancelled');
+    await audit(c, req.user!.sub, 'cert.cancelled', { batchId: x.batch_id, certId: x.id }, { serial: x.serial, reason });
+    return x;
+  });
+  // Overwrite the cache with a cancellation tombstone so verification flips immediately.
+  await redis.set(`verify:${row.token}`, JSON.stringify(view(row)), 'EX', 3600).catch(() => {});
+  publish('cert.cancelled', { batchId: row.batch_id, certId: row.id });
+  res.json({ ok: true });
+}));
 
-  return (
-    <div className="card detail">
-      <div className="detail-head">
-        <div>
-          <h2>{b.title}</h2>
-          <p className="muted small">{b.centre_name} · {b.course} · round {b.round}</p>
-        </div>
-        <Badge s={b.status} />
-      </div>
+// Test/demo hook (off unless ENABLE_TEST_HOOKS=1): pretend a batch has waited 3 days, then run the SLA scan.
+if (cfg.testHooks) r.post('/test/age/:id', auth('STATE'), wrap(async (req, res) => {
+  await pool.query(`UPDATE batches SET stage_entered_at=now()-interval '3 days' WHERE id=$1`, [req.params.id]);
+  res.json(await runScan());
+}));
 
-      <Tracker b={b} bigBatch={bigBatch} />
-
-      {NEED[b.status] && (
-        <p className="small">
-          {d.approvals.length}/{NEED[b.status]} approvals recorded
-          {d.approvals.length > 0 && <> by {d.approvals.map((a: any) => a.officer_name || a.officer_id).join(', ')}</>}.
-          {' '}Waiting for: <b>{STEP_ROLE[b.status]}</b> officers.
-        </p>
-      )}
-      {b.status === 'RETURNED' && <p className="notice amber">Returned for fixes: {b.return_reason}</p>}
-      {msg && <pre className="err">{msg}</pre>}
-
-      {editable && (
-        <div className="actions">
-          <label className="filebtn">
-            Replace CSV
-            <input type="file" accept=".csv,.xlsx,.xls" onChange={async e => {
-              const f = e.target.files?.[0];
-              if (f) act(async () => api(`/batches/${id}/candidates`, token, 'PUT', { csv: await fileToCsv(f) }));
-            }} />
-          </label>
-          <button className="primary" disabled={busy} onClick={() => act(() => api(`/batches/${id}/submit`, token, 'POST'))}>
-            {b.status === 'RETURNED' ? 'Fix done, resubmit' : 'Send for approval'}
-          </button>
-        </div>
-      )}
-      {canDecide && (
-        <div className="actions">
-          <button className="primary" disabled={busy} onClick={() => decide('APPROVE')}>Approve</button>
-          <button className="ghost" disabled={busy} onClick={() => decide('RETURN')}>Send back</button>
-          <button className="danger" disabled={busy} onClick={() => decide('REJECT')}>Reject</button>
-        </div>
-      )}
-
-      {total > 0 ? (
-        <>
-          <h3>Certificates</h3>
-          <div className="progress" title={`${sent} of ${total} delivered`}>
-            <div style={{ width: (sent / total) * 100 + '%' }} />
-          </div>
-          <p className="muted small">{sent} of {total} delivered on WhatsApp</p>
-          <div className="scroll">
-            <table>
-              <thead><tr><th>Serial</th><th>Name</th><th>Delivery</th><th></th></tr></thead>
-              <tbody>
-                {d.certificates.map((c: any) => (
-                  <tr key={c.id}>
-                    <td className="mono">{c.serial}</td>
-                    <td>{c.name}</td>
-                    <td>
-                      <span className={'badge ' + (c.status === 'CANCELLED' ? 'red' : c.delivery_status === 'SENT' ? 'green' : 'amber')}>
-                        {c.status === 'CANCELLED' ? 'Cancelled' : c.delivery_status}
-                      </span>{' '}
-                      <span className="muted small">{c.delivery_attempts} tries</span>
-                    </td>
-                    <td className="row-actions">
-                      <a href={`#/verify/${c.token}`} target="_blank" rel="noreferrer">Verify</a>
-                      {c.status === 'VALID' && <a href={`/api/c/${c.token}/pdf`}>PDF</a>}
-                      {me.role === 'STATE' && c.status === 'VALID' && (
-                        <button className="danger sm" disabled={busy} onClick={() => {
-                          const reason = prompt('Reason for cancelling');
-                          if (reason) act(() => api(`/certificates/${c.id}/cancel`, token, 'POST', { reason }));
-                        }}>Cancel</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      ) : (
-        <>
-          <h3>Candidates ({d.candidates.length})</h3>
-          <div className="scroll">
-            <table>
-              <thead><tr><th>Name</th><th>Phone</th></tr></thead>
-              <tbody>{d.candidates.slice(0, 50).map((c: any) => <tr key={c.id}><td>{c.name}</td><td className="mono">{c.phone}</td></tr>)}</tbody>
-            </table>
-          </div>
-          {d.candidates.length > 50 && <p className="muted small">Showing the first 50 of {d.candidates.length}.</p>}
-        </>
-      )}
-
-      <h3>History</h3>
-      <ul className="timeline">
-        {[...d.timeline].reverse().slice(0, 40).map((t: any, i: number) => (
-          <li key={i}>
-            <span className="muted small">{new Date(t.ts).toLocaleTimeString()}</span>
-            <span><b>{t.actor}</b> {t.action}</span>
-            <details>
-              <summary className="muted small">details</summary>
-              <code className="small">{JSON.stringify(t.details)}</code>
-            </details>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
+app.use('/api', r);
+app.use((e: any, req: Request, res: Response, _n: NextFunction) => {
+  if (e instanceof HttpError) return res.status(e.status).json({ error: e.message, ...e.extra });
+  if (e instanceof z.ZodError) return res.status(400).json({ error: 'Invalid input', issues: e.issues });
+  if (e.code === '23505') return res.status(409).json({ error: 'Conflict: a candidate already holds a valid certificate or the record already exists' });
+  if (e.code === '22P02') return res.status(404).json({ error: 'Not found' });
+  if (e.status && e.status < 500) return res.status(e.status).json({ error: 'Bad request' });
+  (req as any).log.error(e);
+  res.status(500).json({ error: 'Internal error' });
+});
