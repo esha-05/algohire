@@ -16,7 +16,7 @@ export const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 export const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
-app.use(pinoHttp({ logger: log, genReqId: (req: any) => req.headers['x-request-id'] || randomUUID() }) as any);
+app.use(pinoHttp({ logger: log, redact: ['req.headers.authorization'], genReqId: (req: any) => req.headers['x-request-id'] || randomUUID() }) as any);
 app.use(express.json({ limit: '1mb' }));
 const r = express.Router();
 
@@ -103,11 +103,11 @@ r.get('/batches', auth(), wrap(async (req, res) => {
 r.post('/batches', auth('CENTRE'), wrap(async (req, res) => {
   const body = z.object({ title: z.string().trim().min(3).max(100), course: z.string().trim().min(2).max(80), csv: z.string().max(600000) }).parse(req.body);
   const id = await tx(async c => {
-    const rows = await validateCsv(c, body.course, body.csv);
+    const { rows, rule } = await validateCsv(c, body.course, body.csv);
     const { rows: [b] } = await c.query(`INSERT INTO batches(centre_id,title,course,status,created_by) VALUES($1,$2,$3,'DRAFT',$4) RETURNING id`,
       [req.user!.centre, body.title, body.course, req.user!.sub]);
-    await saveCandidates(c, b.id, rows);
-    await audit(c, req.user!.sub, 'batch.created', { batchId: b.id }, { size: rows.length });
+    await saveCandidates(c, b.id, rows, rule.id);
+    await audit(c, req.user!.sub, 'batch.created', { batchId: b.id }, { size: rows.length, ruleVersion: rule.version, ineligible: rows.filter((x: any) => !x.eligible).length });
     return b.id;
   });
   publish('batch.updated', { batchId: id });
@@ -119,9 +119,9 @@ r.put('/batches/:id/candidates', auth('CENTRE'), wrap(async (req, res) => {
   await tx(async c => {
     const b = await getBatch(c, req.params.id, req.user!, true);
     if (!['DRAFT', 'RETURNED'].includes(b.status)) throw new HttpError(409, `Cannot edit a batch that is ${b.status}`);
-    const rows = await validateCsv(c, b.course, csv);
-    await saveCandidates(c, b.id, rows);
-    await audit(c, req.user!.sub, 'batch.candidates_replaced', { batchId: b.id }, { size: rows.length });
+    const { rows, rule } = await validateCsv(c, b.course, csv);
+    await saveCandidates(c, b.id, rows, rule.id);
+    await audit(c, req.user!.sub, 'batch.candidates_replaced', { batchId: b.id }, { size: rows.length, ruleVersion: rule.version, ineligible: rows.filter((x: any) => !x.eligible).length });
   });
   publish('batch.updated', { batchId: req.params.id });
   res.json({ ok: true });
@@ -145,12 +145,12 @@ r.get('/batches/:id', auth(), wrap(async (req, res) => {
   const b = await getBatch(pool, req.params.id, req.user!);
   const q = (s: string, p: any[]) => pool.query(s, p).then(x => x.rows);
   const [candidates, certificates, approvals, timeline] = await Promise.all([
-    q('SELECT id,name,phone FROM candidates WHERE batch_id=$1 ORDER BY name', [b.id]),
+    q('SELECT id,name,phone,attendance,theory,practical,eligible,reasons,override_reason FROM candidates WHERE batch_id=$1 ORDER BY name', [b.id]),
     q('SELECT id,serial,name,status,delivery_status,delivery_attempts,token FROM certificates WHERE batch_id=$1 ORDER BY serial', [b.id]),
     q('SELECT officer_id,stage,created_at FROM approvals WHERE batch_id=$1 AND round=$2', [b.id, b.round]),
     q('SELECT ts,actor,action,cert_id,details FROM audit_log WHERE batch_id=$1 ORDER BY id LIMIT 1000', [b.id]),
   ]);
-  res.json({ batch: b, candidates, certificates, approvals, timeline });
+  res.json({ batch: b, candidates, certificates, approvals, timeline, rule: (await pool.query('SELECT * FROM course_rules WHERE id=$1', [b.rule_id])).rows[0] ?? null });
 }));
 
 // The core workflow. FOR UPDATE serialises concurrent decisions on one batch, so two simultaneous
@@ -177,8 +177,9 @@ r.post('/batches/:id/decision', auth('DISTRICT', 'QUALITY', 'STATE'), wrap(async
             `INSERT INTO certificates(serial,candidate_id,batch_id,name,phone,course,token)
              SELECT 'PSM-'||to_char(now(),'YYYY')||'-'||lpad(nextval('cert_serial_seq')::text,6,'0'), ca.id, $1::uuid, ca.name, ca.phone, $2::text,
                     replace(gen_random_uuid()::text,'-','')||replace(gen_random_uuid()::text,'-','')
-             FROM candidates ca WHERE ca.batch_id=$1::uuid ORDER BY ca.id RETURNING id`, [b.id, b.course]);
+             FROM candidates ca WHERE ca.batch_id=$1::uuid AND (ca.eligible OR ca.override_reason IS NOT NULL) ORDER BY ca.id RETURNING id`, [b.id, b.course]);
           certIds = created.rows.map((x: any) => x.id);
+          if (!certIds.length) next = 'ISSUED';          // nobody qualified: nothing to deliver
           await audit(c, 'system', 'batch.certificates_created', { batchId: b.id }, { count: certIds.length });
         }
         await c.query('UPDATE batches SET status=$2, stage_entered_at=now(), escalated_at=NULL, updated_at=now() WHERE id=$1', [b.id, next]);
@@ -195,6 +196,40 @@ r.post('/batches/:id/decision', auth('DISTRICT', 'QUALITY', 'STATE'), wrap(async
   if (out.certIds.length) await enqueueIssue(out.certIds).catch(e => log.error({ err: e.message }, 'enqueue failed; sweeper will retry'));
   publish('batch.updated', { batchId: out.id });
   res.json({ status: out.status });
+}));
+
+// ---------- course rules (data, versioned, append-only) ----------
+r.get('/courses/rules', auth(), wrap(async (_q, res) => {
+  res.json((await pool.query('SELECT DISTINCT ON (lower(course)) * FROM course_rules ORDER BY lower(course), version DESC')).rows);
+}));
+r.post('/courses/rules', auth('STATE'), wrap(async (req, res) => {
+  const b = z.object({ course: z.string().trim().min(2).max(80), minAttendance: z.number().min(0).max(100), minTheory: z.number().min(0).max(100), minPractical: z.number().min(0).max(100) }).parse(req.body);
+  const row = await tx(async c => {
+    await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [b.course.toLowerCase()]);   // two concurrent edits cannot take the same version
+    const { rows: [x] } = await c.query(
+      `INSERT INTO course_rules(course,version,min_attendance,min_theory,min_practical,created_by)
+       VALUES($1,(SELECT coalesce(max(version),0)+1 FROM course_rules WHERE lower(course)=lower($1)),$2,$3,$4,$5) RETURNING *`,
+      [b.course, b.minAttendance, b.minTheory, b.minPractical, req.user!.sub]);
+    await audit(c, req.user!.sub, 'course_rule.created', {}, x);
+    return x;
+  });
+  res.status(201).json(row);
+}));
+
+// Ineligible candidate gets a certificate ONLY with a recorded override + reason (state office, batch under review).
+r.post('/candidates/:id/override', auth('STATE'), wrap(async (req, res) => {
+  const { reason } = z.object({ reason: z.string().trim().min(3).max(500) }).parse(req.body);
+  const k = await tx(async c => {
+    const { rows: [x] } = await c.query(
+      `UPDATE candidates ca SET override_reason=$2 FROM batches b
+       WHERE ca.id=$1 AND b.id=ca.batch_id AND NOT ca.eligible AND ca.override_reason IS NULL
+         AND b.status IN ('DISTRICT_REVIEW','QUALITY_REVIEW','STATE_REVIEW') RETURNING ca.batch_id`, [req.params.id, reason]);
+    if (!x) throw new HttpError(409, 'Not an ineligible candidate in a batch under review');
+    await audit(c, req.user!.sub, 'candidate.override', { batchId: x.batch_id }, { candidateId: req.params.id, reason });
+    return x;
+  });
+  publish('batch.updated', { batchId: k.batch_id });
+  res.json({ ok: true });
 }));
 
 // ---------- state office ----------
