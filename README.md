@@ -32,7 +32,8 @@ An officer can also **approve**, **send back** (with a reason) or **reject** (wi
 
 | Question in the brief | Our decision |
 |---|---|
-| What is "the spreadsheet"? | Candidate lists are uploaded as **CSV** (the standard export from Excel and Google Sheets). Columns: `name`, `phone`. |
+| What is "the spreadsheet"? | Candidate lists are uploaded as **CSV** (the standard export from Excel and Google Sheets). Columns: `name`, `phone`, `attendance`, `theory_marks`, `practical_marks`. |
+| Who qualifies for a certificate? | **Course rules are versioned data** (minimum attendance, theory and practical marks). Each batch records the rule version it was judged by, so later rule changes never alter old batches. An ineligible candidate gets a certificate only through a **recorded override with a reason** by the state office. |
 | What is a "big batch"? | **50 or more candidates** go through the quality team. |
 | How many district approvals? | **2**, from two different officers. The same officer cannot approve twice. |
 | What happens to old approvals when a batch is sent back and resent? | **They are voided and review starts again.** The candidates changed, so earlier approvals no longer apply. The old approvals stay in the history for the record. |
@@ -139,7 +140,7 @@ Use the "Demo user" dropdown at the top right. Sample data is loaded automatical
 
 ## 7. Tests
 
-11 automated tests, all passing. Each proves one thing from the brief.
+13 automated tests, all passing. Each proves one thing from the brief.
 
 | Test | What it proves |
 |---|---|
@@ -150,6 +151,8 @@ Use the "Demo user" dropdown at the top right. Sample data is loaded automatical
 | 4. Cancel | Cancelled certificate is invalid for verifiers and downloads straight away |
 | 5. Stuck batch | It is escalated to the state office without anyone chasing |
 | 6. Return, fix, resubmit | Earlier approvals are voided and review restarts |
+| 7. Rule versioning | A new rule version does not change how an earlier batch was judged |
+| 8. Override | An ineligible candidate gets no certificate unless overridden with a reason |
 | Never-happen: bad or tampered login | Rejected |
 | Never-happen: wrong role or wrong step | Cannot act |
 | Never-happen: another centre | Cannot see or edit someone else's batch |
@@ -164,13 +167,13 @@ There is also `scenarios.mjs`, a script that runs the main scenarios against the
 **Tools:** Claude (Anthropic).
 
 **What AI helped with**
-- The first version of the backend, worker, WhatsApp mock, frontend and tests.
+- The first version of the backend (including the CSV marks, course rules, eligibility and override), worker, WhatsApp mock, frontend and tests.
 - The new dashboard design (layout, approval tracker, stylesheet).
 - Debugging Docker, Git and test problems.
 
 **How we checked its output**
 - Ran the whole stack with `docker compose up --build` and clicked through the full flow as each demo user.
-- Ran the automated tests. Test 3 failed at first. We investigated and found the WhatsApp mock container had crashed and the queue was full of old failed jobs. After a clean restart (`docker compose down -v`) all 11 tests passed. The cause was our setup, not the code.
+- Ran the automated tests. Test 3 failed at first. We investigated and found the WhatsApp mock container had crashed and the queue was full of old failed jobs. After a clean restart (`docker compose down -v`) all tests passed. The cause was our setup, not the code.
 - Checked the database directly (`certificates` table) to see that retries really happened (38 of 84 certificates needed more than one try).
 - Opened a certificate link from a WhatsApp message and confirmed it downloads a PDF without logging in.
 - Where AI first guessed wrong about a problem (for example the cause of the failing test), we ran the checks first and only fixed what the output showed.
@@ -179,6 +182,7 @@ There is also `scenarios.mjs`, a script that runs the main scenarios against the
 
 ## 9. Known gaps and next steps (honest list)
 
+- **Test-only hook.** A flag used by the tests to speed up the stuck-batch check; it must be off in production.
 - **CSV only.** Excel files must be saved as CSV first. Reading `.xlsx` directly is a next step.
 - **Demo login is not real authentication.** A real version needs proper sign-in, password or OTP, and sessions.
 - **Delivery after many failures.** A certificate that fails all its retries is marked FAILED. A background sweeper tries to re-queue it, but we did not test a long WhatsApp outage.
